@@ -6,5 +6,13 @@ transcript_output/
 *.log
 run_space_supervisor_full_*.sh
 .venv/
+.venv.*/
 venv/
 .pytest_cache/
+.launcher/
+.env
+.env.*
+cookies*.txt
+cookies*.json
+*.cookies.txt
+config.local.json

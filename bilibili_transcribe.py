@@ -33,6 +33,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import urllib.error
@@ -171,6 +172,63 @@ def has_module(module_name: str) -> bool:
     return importlib.util.find_spec(module_name) is not None
 
 
+def resolve_ffmpeg_executable() -> str | None:
+    """解析可用的 ffmpeg 可执行文件路径。"""
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        return ffmpeg_path
+
+    if has_module("imageio_ffmpeg"):
+        try:
+            import imageio_ffmpeg
+
+            bundled_ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return None
+
+        if bundled_ffmpeg and Path(bundled_ffmpeg).exists():
+            return bundled_ffmpeg
+
+    return None
+
+
+def ensure_ffmpeg_available_for_subprocess() -> str:
+    """确保依赖 subprocess 调用 ffmpeg 的库也能找到可执行文件。"""
+    ffmpeg_executable = resolve_ffmpeg_executable()
+    if ffmpeg_executable is None:
+        raise RuntimeError("未找到可用的 ffmpeg。请安装系统 ffmpeg，或安装 imageio-ffmpeg。")
+
+    ffmpeg_path = Path(ffmpeg_executable).resolve()
+    ffmpeg_dir_path = ffmpeg_path.parent
+    ffmpeg_dir = str(ffmpeg_dir_path)
+
+    if ffmpeg_path.name != "ffmpeg":
+        alias_dir = Path(tempfile.gettempdir()) / "bilibili_transcribe_ffmpeg_bin"
+        alias_dir.mkdir(parents=True, exist_ok=True)
+        alias_path = alias_dir / "ffmpeg"
+        if alias_path.exists() or alias_path.is_symlink():
+            if alias_path.resolve() != ffmpeg_path:
+                alias_path.unlink()
+        if not alias_path.exists():
+            try:
+                alias_path.symlink_to(ffmpeg_path)
+            except OSError:
+                alias_path.write_text(
+                    "#!/bin/sh\n"
+                    f'exec "{ffmpeg_path}" "$@"\n',
+                    encoding="utf-8",
+                )
+                alias_path.chmod(0o755)
+        ffmpeg_dir = str(alias_dir)
+
+    current_path = os.environ.get("PATH", "")
+    path_entries = current_path.split(os.pathsep) if current_path else []
+    if ffmpeg_dir not in path_entries:
+        os.environ["PATH"] = ffmpeg_dir if not current_path else ffmpeg_dir + os.pathsep + current_path
+
+    return ffmpeg_executable
+
+
 def ensure_dependencies() -> None:
     """检查运行所需依赖。"""
     missing = []
@@ -181,15 +239,15 @@ def ensure_dependencies() -> None:
     if not (has_module("faster_whisper") or has_module("whisper")):
         missing.append("faster-whisper 或 openai-whisper")
 
-    if shutil.which("ffmpeg") is None:
-        missing.append("ffmpeg（系统命令）")
+    if resolve_ffmpeg_executable() is None:
+        missing.append("ffmpeg（系统命令）或 imageio-ffmpeg")
 
     if missing:
         raise RuntimeError(
             "缺少依赖："
             + "、".join(missing)
-            + "\n请先执行：pip install yt-dlp faster-whisper openai-whisper\n"
-            + "并安装 ffmpeg（例如 macOS: brew install ffmpeg）"
+            + "\n请先执行：pip install yt-dlp faster-whisper openai-whisper imageio-ffmpeg\n"
+            + "\n如果未安装系统 ffmpeg，可直接使用 imageio-ffmpeg 提供的内置二进制。"
         )
 
 
@@ -207,6 +265,10 @@ def is_valid_bilibili_url(url: str) -> bool:
 def launch_in_new_terminal_if_needed() -> None:
     """如果尚未在子终端中运行，则新开终端窗口后退出当前进程。"""
     if os.environ.get(SCRIPT_FLAG) == "1":
+        return
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        log("检测到非交互运行环境，将直接在当前进程执行。")
         return
 
     if os.environ.get("TERM_PROGRAM", "").lower() == "vscode":
@@ -245,6 +307,21 @@ def launch_in_new_terminal_if_needed() -> None:
 def sanitize_title(title: str) -> str:
     """生成安全的文件名标题。"""
     return re.sub(r"[\\/:*?\"<>|]", "_", title).strip() or "bilibili_video"
+
+
+def create_title_output_directory(parent: Path, title: str) -> Path:
+    """按标题创建独立目录；同名任务使用序号，避免覆盖已有结果。"""
+    safe_title = sanitize_title(title).strip(". ") or "bilibili_video"
+    number = 1
+    while True:
+        name = safe_title if number == 1 else f"{safe_title} ({number})"
+        output_dir = parent / name
+        try:
+            output_dir.mkdir(parents=True)
+        except FileExistsError:
+            number += 1
+        else:
+            return output_dir
 
 
 def load_cookie_jar_from_file(cookie_file: Path | None) -> http.cookiejar.CookieJar | None:
@@ -350,10 +427,15 @@ def build_yt_dlp_options(work_dir: Path, auth_cfg: BilibiliAuthConfig) -> dict:
     """构造统一的 yt-dlp 参数。"""
     ydl_opts = {
         "format": "bestaudio/best*[acodec!=none]/best[acodec!=none]",
-        "outtmpl": str(work_dir / "source_audio.%(ext)s"),
+        "outtmpl": str(work_dir).replace("%", "%%") + "/source_audio.%(ext)s",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "socket_timeout": 30,
+        "retries": 5,
+        "extractor_retries": 5,
+        "fragment_retries": 5,
+        "file_access_retries": 3,
         "http_headers": auth_cfg.http_headers,
         "postprocessors": [
             {
@@ -363,6 +445,10 @@ def build_yt_dlp_options(work_dir: Path, auth_cfg: BilibiliAuthConfig) -> dict:
         ],
         "postprocessor_args": ["-ar", "16000", "-ac", "1", "-vn"],
     }
+
+    ffmpeg_executable = resolve_ffmpeg_executable()
+    if ffmpeg_executable is not None:
+        ydl_opts["ffmpeg_location"] = ffmpeg_executable
 
     if auth_cfg.cookie_file is not None:
         ydl_opts["cookiefile"] = str(auth_cfg.cookie_file)
@@ -430,7 +516,13 @@ def raise_charge_video_access_error(auth_cfg: BilibiliAuthConfig, detail: str | 
     raise RuntimeError(f"{message}{hint}")
 
 
-def download_audio(url: str, work_dir: Path, auth_cfg: BilibiliAuthConfig) -> tuple[Path, str, str]:
+def download_audio(
+    url: str,
+    work_dir: Path,
+    auth_cfg: BilibiliAuthConfig,
+    *,
+    use_title_directory: bool = False,
+) -> tuple[Path, str, str]:
     """下载 B 站视频音频，返回音频文件路径、视频标题和视频类型。"""
     import yt_dlp
 
@@ -484,6 +576,13 @@ def download_audio(url: str, work_dir: Path, auth_cfg: BilibiliAuthConfig) -> tu
 
     if not has_usable_audio_formats(info):
         raise RuntimeError("该视频没有可用音频流，无法执行语音转写。")
+
+    if use_title_directory:
+        output_title = str((info or {}).get("title") or title or "bilibili_video").strip()
+        work_dir = create_title_output_directory(work_dir, output_title)
+        audio_path = work_dir / "source_audio.wav"
+        ydl_opts = build_yt_dlp_options(work_dir, auth_cfg)
+        log(f"本次任务输出目录：{work_dir}")
 
     log("开始下载并提取音频...")
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -645,6 +744,7 @@ def transcribe_with_openai_whisper(audio_path: Path, model_name: str) -> Transcr
     """使用 openai-whisper 转写（支持 CUDA/MPS）。"""
     import whisper
 
+    ffmpeg_executable = ensure_ffmpeg_available_for_subprocess()
     device = detect_torch_device()
     if device == "mps":
         log("检测到 MPS，但当前 openai-whisper 在此环境下可能触发 SparseMPS 错误，改用 CPU。", "WARN")
@@ -652,6 +752,7 @@ def transcribe_with_openai_whisper(audio_path: Path, model_name: str) -> Transcr
 
     use_fp16 = device == "cuda"
     log(f"使用 openai-whisper 后端（device={device}, fp16={use_fp16}）")
+    log(f"音频解码使用 ffmpeg：{ffmpeg_executable}")
     log(f"加载模型：{model_name}（首次运行会下载模型）")
     try:
         model = whisper.load_model(model_name, device=device)
@@ -1217,6 +1318,10 @@ def parse_args() -> argparse.Namespace:
     """解析命令行参数。"""
     parser = argparse.ArgumentParser(description="Bilibili 视频转写工具")
     parser.add_argument(
+        "--url",
+        help="直接传入 Bilibili 视频链接，适合脚本化或非交互运行",
+    )
+    parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help="Whisper 模型名（默认 small，可选 tiny/base/small/medium/large-v3）",
@@ -1262,8 +1367,11 @@ def main() -> None:
 
     url = ""
     if raw_transcript_input is None:
-        print("请输入您要转写的bilibili视频链接：", end="", flush=True)
-        url = input().strip()
+        if args.url:
+            url = args.url.strip()
+        else:
+            print("请输入您要转写的bilibili视频链接：", end="", flush=True)
+            url = input().strip()
 
         if not url:
             raise ValueError("未输入链接，程序已终止。")
@@ -1287,21 +1395,23 @@ def main() -> None:
     )
     log(f"B站登录态：{describe_bilibili_auth_config(bilibili_auth_cfg)}")
 
-    now = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_mode = "reformat_from_raw" if raw_transcript_input is not None else "full_pipeline"
     if raw_transcript_input is None:
-        base_dir = Path.cwd() / "transcript_output" / now
+        base_dir = Path.cwd() / "transcript_output"
     else:
-        base_dir = raw_transcript_input.parent / f"reformat_{now}"
-    base_dir.mkdir(parents=True, exist_ok=True)
-    log(f"本次任务输出目录：{base_dir}")
+        title = re.sub(r"_transcript_raw$", "", raw_transcript_input.stem)
+        base_dir = create_title_output_directory(raw_transcript_input.parent, f"{title}_重新整理")
+        log(f"本次任务输出目录：{base_dir}")
 
     total_start = time.perf_counter()
     video_type_label: str | None = None
 
     if raw_transcript_input is None:
         step_start = time.perf_counter()
-        audio_path, title, video_type_label = download_audio(url, base_dir, bilibili_auth_cfg)
+        audio_path, title, video_type_label = download_audio(
+            url, base_dir, bilibili_auth_cfg, use_title_directory=True
+        )
+        base_dir = audio_path.parent
         log(f"音频准备耗时：{time.perf_counter() - step_start:.1f} 秒")
 
         step_start = time.perf_counter()

@@ -1,0 +1,27 @@
+{
+  "bilibili_auth": {
+    "cookie_file": "",
+    "cookies_from_browser": null,
+    "user_agent": "",
+    "referer": "https://www.bilibili.com/",
+    "headers": {}
+  },
+  "llm_formatting": {
+    "enabled": false,
+    "provider": "deepseek",
+    "chunk_max_chars": 4000,
+    "request_timeout_seconds": 180,
+    "temperature": 0.0,
+    "parallel_requests": 4,
+    "retry_count": 0,
+    "providers": {
+      "deepseek": {
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+        "api_key": "",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "ssl_verify": true
+      }
+    }
+  }
+}

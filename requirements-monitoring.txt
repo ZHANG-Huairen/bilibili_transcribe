@@ -1,0 +1,4 @@
+# Optional Apple Silicon dependencies for bilibili_recent_batch.py and repairs.
+-r requirements.txt
+mlx-whisper==0.4.3
+opencc-python-reimplemented==0.1.7

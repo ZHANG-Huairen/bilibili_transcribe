@@ -1,3 +1,4 @@
-yt-dlp==2026.3.13
+yt-dlp==2026.8.19
 openai-whisper==20250625
 torch==2.10.0
+imageio-ffmpeg==0.6.0
